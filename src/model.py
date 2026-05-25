@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils import checkpoint
 import math
 from dataclasses import dataclass
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
@@ -22,6 +23,8 @@ class Attention(nn.Module):
         self.head_dim = n_embd // n_head
         self.qkv = nn.Linear(n_embd, 3 * n_embd)
         self.proj = nn.Linear(n_embd, n_embd)
+        # Flag for special GPT-2 residual scaling
+        self.proj.RESIDUAL_SCALE_FLAG = True
 
     def _apply_rope(self, x, seq_len, device):
         # x shape: (B, n_head, T, head_dim)
@@ -58,15 +61,13 @@ class Attention(nn.Module):
         q = self._apply_rope(q, T, x.device)
         k = self._apply_rope(k, T, x.device)
         
-        # Scaled dot-product attention
-        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        
-        # Causal mask
-        mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-        attn = attn.masked_fill(mask == 0, float('-inf'))
-        
-        attn = F.softmax(attn, dim=-1)
-        out = attn @ v
+        # Memory-efficient Scaled Dot-Product Attention (includes Flash Attention)
+        # is_causal=True automatically handles the triangular masking
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            is_causal=True,
+            dropout_p=0.0 if not self.training else 0.1
+        )
         
         # Merge heads
         out = out.transpose(1, 2).contiguous().view(B, T, C)
@@ -78,6 +79,8 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(n_embd, 4 * n_embd)
         self.c_proj = nn.Linear(4 * n_embd, n_embd)
+        # Flag for special GPT-2 residual scaling
+        self.c_proj.RESIDUAL_SCALE_FLAG = True
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -125,13 +128,24 @@ class GPT2Modded(nn.Module, GenerationMixin):
         self.config = config
         self.main_input_name = "input_ids"
         self.generation_config = GenerationConfig()
+        self.gradient_checkpointing = False
         
         # Proper weight initialization
         self.apply(self._init_weights)
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing = False
+
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            std = 0.02
+            # Apply GPT-2 residual scaling for stability in deep models
+            if hasattr(module, 'RESIDUAL_SCALE_FLAG'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -151,7 +165,10 @@ class GPT2Modded(nn.Module, GenerationMixin):
         x = self.transformer.wte(input_ids)
         
         for block in self.transformer.h:
-            x = block(x)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         

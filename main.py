@@ -2,6 +2,8 @@ import modal
 from dataclasses import dataclass
 
 app = modal.App("transformer-speedrun")
+volume = modal.Volume.from_name("transformer-speedrun-data", create_if_missing=True)
+
 image = (
     modal.Image.debian_slim()
     .uv_pip_install("transformers[torch]")
@@ -12,13 +14,14 @@ image = (
 
 
 @app.function(
-    gpu="a10",
+    gpu="A100-80GB",
     image=image,
-    timeout=3600,
-    secrets=[modal.Secret.from_name("wandb-api-key")],
+    timeout=2*3600,
+    volumes={"/data": volume},
+    secrets=[modal.Secret.from_name("wandb-api-key"), modal.Secret.from_name("huggingface")],
 )
 def train(model_type: str = "gpt2"):
-    from datasets import load_dataset
+    from datasets import load_dataset, load_from_disk
     from transformers import (
         AutoTokenizer,
         GPT2Config,
@@ -28,7 +31,6 @@ def train(model_type: str = "gpt2"):
         TrainingArguments,
         TrainerCallback,
     )
-    from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
     import os
     import wandb
     import torch
@@ -39,32 +41,50 @@ def train(model_type: str = "gpt2"):
     # Import custom model from src
     from src.model import GPT2Modded, GPT2Config as GPT2ConfigModded
 
-    # 1. Load the dataset
-    print("Loading wikitext-103 dataset...")
-    ds = load_dataset("Salesforce/wikitext", "wikitext-103-v1")
-
-    # Only run on 100% of the dataset
-    print("Subsetting to 100% of dataset...")
-    ds["train"] = ds["train"].select(range(int(len(ds["train"]) * 0.05)))
-    ds["validation"] = ds["validation"].select(range(int(len(ds["validation"]) * 1.0)))
-
-    # 2. Setup tokenizer
-    # Using GPT-2 tokenizer as a base
+    # 1. Setup tokenizer first to check cache
     model_name = "gpt2"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    # 3. Tokenize the dataset
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=512)
+    # 2. Load or tokenize the dataset
+    cache_path = "/data/tokenized_fineweb_1b"
+    
+    if os.path.exists(cache_path):
+        print(f"Loading tokenized dataset from volume: {cache_path}")
+        tokenized_datasets = load_from_disk(cache_path)
+    else:
+        print("Loading FineWeb (sample-10BT) dataset...")
+        # Load 10% of the 10BT sample to get ~1B tokens
+        dataset = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train")
+        
+        print("Subsetting to 10% of sample-10BT (~1B tokens)...")
+        # Using 10% to approximate 1B tokens (10% of 10B)
+        dataset = dataset.select(range(int(len(dataset) * 0.001)))
+        
+        # FineWeb only has a 'train' split, so we create our own validation set
+        print("Creating validation split...")
+        split_ds = dataset.train_test_split(test_size=0.005, seed=42)
+        from datasets import DatasetDict
+        ds = DatasetDict({
+            "train": split_ds["train"],
+            "validation": split_ds["test"]
+        })
 
-    print("Tokenizing dataset...")
-    tokenized_datasets = ds.map(
-        tokenize_function, batched=True, num_proc=4, remove_columns=["text"]
-    )
+        # 3. Tokenize the dataset
+        def tokenize_function(examples):
+            return tokenizer(examples["text"], truncation=True, max_length=512)
 
-    # Filter out empty examples
-    tokenized_datasets = tokenized_datasets.filter(lambda x: len(x["input_ids"]) > 0)
+        print("Tokenizing dataset...")
+        tokenized_datasets = ds.map(
+            tokenize_function, batched=True, num_proc=8, remove_columns=["text"]
+        )
+
+        # Filter out empty examples
+        tokenized_datasets = tokenized_datasets.filter(lambda x: len(x["input_ids"]) > 0)
+        
+        print(f"Saving tokenized dataset to volume: {cache_path}")
+        tokenized_datasets.save_to_disk(cache_path)
+        volume.commit() # Ensure data is written to the volume
 
     # 4. Initialize the model
     # Configuration matches the requested parameters
@@ -83,13 +103,13 @@ def train(model_type: str = "gpt2"):
         print("Using standard HuggingFace GPT2LMHeadModel...")
         model = GPT2LMHeadModel(config)
 
-    # Explicitly move model to GPU if available
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    # In multi-GPU setups, the Trainer handles device placement.
+    # We just log the availability here.
+    device_count = torch.cuda.device_count()
+    print(f"Detected {device_count} GPUs.")
     
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model size: {model_size:,} parameters")
-    print(f"Device: {next(model.parameters()).device}")
     # Store model size in config so it's logged to wandb by the Trainer
     model.config.model_params = model_size
 
@@ -101,16 +121,19 @@ def train(model_type: str = "gpt2"):
         output_dir="./results",
         num_train_epochs=2,
         per_device_train_batch_size=8,
+        gradient_accumulation_steps=4, # 16 * 4 = 64 effective batch size
+        gradient_checkpointing=True,   # Huge memory saver
         save_steps=500,
         save_total_limit=2,
-        logging_steps=25,
+        logging_steps=1,
         learning_rate=5e-4,
         weight_decay=0.01,
-        fp16=True,  # Use mixed precision
+        bf16=True,
+        dataloader_num_workers=4,
         lr_scheduler_type="cosine",
         warmup_steps=1000,
         report_to="wandb",
-        run_name="transformer-speedrun-pretrain-12L-12H",
+        run_name="transformer-speedrun-pretrain-24L-16H-1GPU-Optimized",
         eval_strategy="steps",
         eval_steps=100,
     )
@@ -159,21 +182,17 @@ def train(model_type: str = "gpt2"):
     class PerplexityCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             if logs is not None:
-                perp_logs = {}
                 try:
                     if "loss" in logs:
-                        train_perp = math.exp(logs["loss"])
-                        logs["train_perplexity"] = train_perp
-                        perp_logs["train_perplexity"] = train_perp
+                        perplexity = math.exp(logs["loss"])
+                        logs["train_perplexity"] = perplexity
+                        if wandb.run is not None:
+                            wandb.log({"train_perplexity": perplexity}, step=state.global_step)
                     if "eval_loss" in logs:
-                        eval_perp = math.exp(logs["eval_loss"])
-                        logs["eval_perplexity"] = eval_perp
-                        perp_logs["eval_perplexity"] = eval_perp
-
-                    # Directly log to wandb if available to ensure it's recorded
-                    if wandb.run is not None and perp_logs:
-                        wandb.log(perp_logs, step=state.global_step)
-
+                        eval_perplexity = math.exp(logs["eval_loss"])
+                        logs["eval_perplexity"] = eval_perplexity
+                        if wandb.run is not None:
+                            wandb.log({"eval_perplexity": eval_perplexity}, step=state.global_step)
                 except (OverflowError, math.OverflowError):
                     pass
 
