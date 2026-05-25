@@ -9,7 +9,9 @@ image = (
     .uv_pip_install("transformers[torch]")
     .uv_pip_install("datasets")
     .uv_pip_install("wandb")
+    .uv_pip_install("pyyaml")
     .add_local_dir("src", remote_path="/root/src")
+    .add_local_dir("cfg", remote_path="/root/cfg")
 )
 
 
@@ -32,6 +34,7 @@ def train(model_type: str = "gpt2"):
         TrainerCallback,
     )
     import os
+    import yaml
     import wandb
     import torch
     import torch.nn as nn
@@ -88,19 +91,45 @@ def train(model_type: str = "gpt2"):
 
     # 4. Initialize the model
     # Configuration matches the requested parameters
-    config = GPT2Config(
-        vocab_size=tokenizer.vocab_size,
-        n_positions=512,
-        n_embd=1024,
-        n_layer=24,
-        n_head=16,
-    )
+    config_params = {
+        "vocab_size": tokenizer.vocab_size,
+        "n_positions": 512,
+        "n_embd": 1024,
+        "n_layer": 24,
+        "n_head": 16,
+    }
+
+    # Check for YAML config in cfg directory
+    config_from_yaml = False
+    # Check if model_type is a path to a yaml file or a key in cfg
+    potential_yaml_paths = [
+        os.path.join("/root/cfg", f"{model_type}.yaml"),
+        os.path.join("/root/cfg", model_type if model_type.endswith(".yaml") else f"{model_type}.yaml"),
+        model_type if model_type.endswith(".yaml") else None
+    ]
     
-    if model_type == "gpt2_modded":
-        print("Using custom GPT2Modded architecture...")
+    for yaml_path in potential_yaml_paths:
+        if yaml_path and os.path.exists(yaml_path):
+            print(f"Loading model configuration from {yaml_path}...")
+            with open(yaml_path, "r") as f:
+                yaml_config = yaml.safe_load(f)
+                if "hyperparams" in yaml_config:
+                    config_params.update(yaml_config["hyperparams"])
+                else:
+                    config_params.update(yaml_config)
+            config_from_yaml = True
+            break
+
+    # Use the appropriate Config class
+    if model_type == "gpt2_modded" or config_from_yaml:
+        print(f"Using custom GPT2Modded architecture with params: {config_params}")
+        config = GPT2ConfigModded(**config_params)
         model = GPT2Modded(config)
     else:
-        print("Using standard HuggingFace GPT2LMHeadModel...")
+        print(f"Using standard HuggingFace GPT2LMHeadModel with params: {config_params}")
+        # HF GPT2Config uses slightly different attribute names for some things, 
+        # but the ones we use (n_embd, n_layer, n_head, n_positions) are standard.
+        config = GPT2Config(**config_params)
         model = GPT2LMHeadModel(config)
 
     # In multi-GPU setups, the Trainer handles device placement.
@@ -186,18 +215,13 @@ def train(model_type: str = "gpt2"):
                     if "loss" in logs:
                         # HF Trainer multiplies loss by gradient_accumulation_steps in
                         # training_step but does not divide it back before logging, so
-                        # we correct for that here.
-                        true_loss = logs["loss"] / args.gradient_accumulation_steps
-                        logs["loss"] = true_loss
-                        perplexity = math.exp(true_loss)
-                        logs["train_perplexity"] = perplexity
-                        if wandb.run is not None:
-                            wandb.log({"loss": true_loss, "train_perplexity": perplexity}, step=state.global_step)
+                        # we correct for that here. This callback is inserted at index 0
+                        # so it runs before WandbCallback and the corrected value is
+                        # what gets sent to wandb.
+                        logs["loss"] = logs["loss"] / args.gradient_accumulation_steps
+                        logs["train_perplexity"] = math.exp(logs["loss"])
                     if "eval_loss" in logs:
-                        eval_perplexity = math.exp(logs["eval_loss"])
-                        logs["eval_perplexity"] = eval_perplexity
-                        if wandb.run is not None:
-                            wandb.log({"eval_perplexity": eval_perplexity}, step=state.global_step)
+                        logs["eval_perplexity"] = math.exp(logs["eval_loss"])
                 except (OverflowError, math.OverflowError):
                     pass
 
@@ -207,8 +231,11 @@ def train(model_type: str = "gpt2"):
         data_collator=data_collator,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
-        callbacks=[GenerationCallback(tokenizer), PerplexityCallback()],
+        callbacks=[GenerationCallback(tokenizer)],
     )
+    # Insert before WandbCallback so logs["loss"] is corrected before wandb reads it
+    trainer.add_callback(PerplexityCallback())
+    trainer.callback_handler.callbacks.insert(0, trainer.callback_handler.callbacks.pop())
 
     # 8. Train
     print("Starting pre-training...")
