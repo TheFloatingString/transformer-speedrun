@@ -101,18 +101,27 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-@dataclass
-class GPT2Config:
-    vocab_size: int = 50257
-    n_positions: int = 1024
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    model_params: int = 0
+from transformers import PretrainedConfig
 
-    def to_dict(self):
-        from dataclasses import asdict
-        return asdict(self)
+class GPT2Config(PretrainedConfig):
+    model_type = "gpt2"
+    def __init__(
+        self,
+        vocab_size=50257,
+        n_positions=1024,
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        model_params=0,
+        **kwargs
+    ):
+        self.vocab_size = vocab_size
+        self.n_positions = n_positions
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.model_params = model_params
+        super().__init__(**kwargs)
 
 from transformers import GenerationMixin, GenerationConfig
 
