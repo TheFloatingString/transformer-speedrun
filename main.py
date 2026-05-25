@@ -172,7 +172,7 @@ def train(model_type: str = "gpt2", force_tokenize: bool = False, muon: bool = T
         run_name=run_name,
         eval_strategy="steps",
         eval_steps=100,
-        max_steps=2e7,                # Limit steps for the speedrun
+        max_steps=20000000,                # Limit steps for the speedrun (20M)
     )
 
     # 7. Custom Optimizer Setup (Muon + AdamW)
