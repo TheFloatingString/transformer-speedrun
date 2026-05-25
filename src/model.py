@@ -108,6 +108,11 @@ class GPT2Config:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    model_params: int = 0
+
+    def to_dict(self):
+        from dataclasses import asdict
+        return asdict(self)
 
 from transformers import GenerationMixin, GenerationConfig
 
