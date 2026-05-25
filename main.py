@@ -1,4 +1,5 @@
 import modal
+from dataclasses import dataclass
 
 app = modal.App("transformer-speedrun")
 image = (
@@ -6,6 +7,7 @@ image = (
     .uv_pip_install("transformers[torch]")
     .uv_pip_install("datasets")
     .uv_pip_install("wandb")
+    .add_local_dir("src", remote_path="/root/src")
 )
 
 
@@ -15,7 +17,7 @@ image = (
     timeout=3600,
     secrets=[modal.Secret.from_name("wandb-api-key")],
 )
-def train():
+def train(model_type: str = "gpt2"):
     from datasets import load_dataset
     from transformers import (
         AutoTokenizer,
@@ -26,10 +28,16 @@ def train():
         TrainingArguments,
         TrainerCallback,
     )
+    from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
     import os
     import wandb
     import torch
+    import torch.nn as nn
+    from torch.nn import functional as F
     import math
+
+    # Import custom model from src
+    from src.model import GPT2Modded, GPT2Config as GPT2ConfigModded
 
     # 1. Load the dataset
     print("Loading wikitext-103 dataset...")
@@ -37,7 +45,7 @@ def train():
 
     # Only run on 100% of the dataset
     print("Subsetting to 100% of dataset...")
-    ds["train"] = ds["train"].select(range(int(len(ds["train"]) * 1.0)))
+    ds["train"] = ds["train"].select(range(int(len(ds["train"]) * 0.05)))
     ds["validation"] = ds["validation"].select(range(int(len(ds["validation"]) * 1.0)))
 
     # 2. Setup tokenizer
@@ -58,18 +66,30 @@ def train():
     # Filter out empty examples
     tokenized_datasets = tokenized_datasets.filter(lambda x: len(x["input_ids"]) > 0)
 
-    # 4. Initialize a small model
-    # Very small config for demonstration
+    # 4. Initialize the model
+    # Configuration matches the requested parameters
     config = GPT2Config(
         vocab_size=tokenizer.vocab_size,
         n_positions=512,
-        n_embd=768,
-        n_layer=12,
-        n_head=12,
+        n_embd=1024,
+        n_layer=24,
+        n_head=16,
     )
-    model = GPT2LMHeadModel(config)
+    
+    if model_type == "gpt2_modded":
+        print("Using custom GPT2Modded architecture...")
+        model = GPT2Modded(config)
+    else:
+        print("Using standard HuggingFace GPT2LMHeadModel...")
+        model = GPT2LMHeadModel(config)
+
+    # Explicitly move model to GPU if available
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model size: {model_size:,} parameters")
+    print(f"Device: {next(model.parameters()).device}")
     # Store model size in config so it's logged to wandb by the Trainer
     model.config.model_params = model_size
 
@@ -92,7 +112,7 @@ def train():
         report_to="wandb",
         run_name="transformer-speedrun-pretrain-12L-12H",
         eval_strategy="steps",
-        eval_steps=500,
+        eval_steps=100,
     )
 
     # 7. Initialize Trainer
@@ -101,7 +121,7 @@ def train():
             self.tokenizer = tokenizer
 
         def on_step_end(self, args, state, control, **kwargs):
-            if state.global_step > 0 and state.global_step % 500 == 0:
+            if state.global_step > 0 and state.global_step % 100 == 0:
                 print(f"\n--- Step {state.global_step} ---")
                 print("Generating sample sentences...")
                 model = kwargs["model"]
@@ -114,9 +134,9 @@ def train():
                 ]
 
                 for prompt in prompts:
-                    inputs = self.tokenizer(prompt, return_tensors="pt").to(
-                        model.device
-                    )
+                    # Get device from model parameters (works for both HF models and custom nn.Modules)
+                    device = next(model.parameters()).device
+                    inputs = self.tokenizer(prompt, return_tensors="pt").to(device)
                     with torch.no_grad():
                         outputs = model.generate(
                             **inputs,
@@ -173,3 +193,8 @@ def train():
     # 9. Save the model
     trainer.save_model("./final_model")
     print("Training complete! Model saved to ./final_model")
+
+
+@app.local_entrypoint()
+def main(model: str = "gpt2"):
+    train.remote(model_type=model)
