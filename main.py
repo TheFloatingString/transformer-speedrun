@@ -10,15 +10,16 @@ def train():
     import os
     import wandb
     import torch
+    import math
 
     # 1. Load the dataset
     print("Loading wikitext-103 dataset...")
     ds = load_dataset("Salesforce/wikitext", "wikitext-103-v1")
 
-    # Only run on 10% of the dataset for speed
-    print("Subsetting to 10% of dataset...")
-    ds["train"] = ds["train"].select(range(int(len(ds["train"]) * 0.1)))
-    ds["validation"] = ds["validation"].select(range(int(len(ds["validation"]) * 0.1)))
+    # Only run on 100% of the dataset 
+    print("Subsetting to 100% of dataset...")
+    ds["train"] = ds["train"].select(range(int(len(ds["train"]) * 1.0)))
+    ds["validation"] = ds["validation"].select(range(int(len(ds["validation"]) * 1.0)))
 
     # 2. Setup tokenizer
     # Using GPT-2 tokenizer as a base
@@ -46,11 +47,15 @@ def train():
     config = GPT2Config(
         vocab_size=tokenizer.vocab_size,
         n_positions=512,
-        n_embd=256,
-        n_layer=4,
-        n_head=4,
+        n_embd=768,
+        n_layer=12,
+        n_head=12,
     )
     model = GPT2LMHeadModel(config)
+    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model size: {model_size:,} parameters")
+    # Store model size in config so it's logged to wandb by the Trainer
+    model.config.model_params = model_size
 
     # 5. Data collator
     data_collator = DataCollatorForLanguageModeling(
@@ -60,7 +65,7 @@ def train():
     # 6. Training arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=5,
+        num_train_epochs=2,
         per_device_train_batch_size=8,
         save_steps=500,
         save_total_limit=2,
@@ -71,7 +76,9 @@ def train():
         lr_scheduler_type="cosine",
         warmup_steps=1000,
         report_to="wandb",
-        run_name="transformer-speedrun-pretrain-1pct",
+        run_name="transformer-speedrun-pretrain-12L-12H",
+        eval_strategy="steps",
+        eval_steps=500,
     )
 
     # 7. Initialize Trainer
@@ -79,36 +86,58 @@ def train():
         def __init__(self, tokenizer):
             self.tokenizer = tokenizer
 
-        def on_epoch_end(self, args, state, control, **kwargs):
-            print(f"\n--- End of Epoch {state.epoch} ---")
-            print("Generating sample sentences...")
-            model = kwargs["model"]
-            
-            model.eval()
-            prompts = [
-                "The quick brown fox",
-                "Artificial intelligence is",
-                "The history of the world",
-            ]
-            
-            for prompt in prompts:
-                inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
-                with torch.no_grad():
-                    outputs = model.generate(
-                        **inputs,
-                        max_length=50,
-                        num_return_sequences=1,
-                        no_repeat_ngram_size=2,
-                        do_sample=True,
-                        top_k=50,
-                        top_p=0.95,
-                        temperature=0.7,
-                    )
-                generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                print(f"\nPrompt: {prompt}")
-                print(f"Generated: {generated_text}")
-            model.train() # Switch back to training mode
-            print("-" * 30)
+        def on_step_end(self, args, state, control, **kwargs):
+            if state.global_step > 0 and state.global_step % 500 == 0:
+                print(f"\n--- Step {state.global_step} ---")
+                print("Generating sample sentences...")
+                model = kwargs["model"]
+                
+                model.eval()
+                prompts = [
+                    "The quick brown fox",
+                    "Artificial intelligence is",
+                    "The history of the world",
+                ]
+                
+                for prompt in prompts:
+                    inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_length=50,
+                            num_return_sequences=1,
+                            no_repeat_ngram_size=2,
+                            do_sample=True,
+                            top_k=50,
+                            top_p=0.95,
+                            temperature=0.7,
+                        )
+                    generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    print(f"\nPrompt: {prompt}")
+                    print(f"Generated: {generated_text}")
+                model.train() # Switch back to training mode
+                print("-" * 30)
+
+    class PerplexityCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is not None:
+                perp_logs = {}
+                try:
+                    if "loss" in logs:
+                        train_perp = math.exp(logs["loss"])
+                        logs["train_perplexity"] = train_perp
+                        perp_logs["train_perplexity"] = train_perp
+                    if "eval_loss" in logs:
+                        eval_perp = math.exp(logs["eval_loss"])
+                        logs["eval_perplexity"] = eval_perp
+                        perp_logs["eval_perplexity"] = eval_perp
+                    
+                    # Directly log to wandb if available to ensure it's recorded
+                    if wandb.run is not None and perp_logs:
+                        wandb.log(perp_logs, step=state.global_step)
+                        
+                except (OverflowError, math.OverflowError):
+                    pass
 
     trainer = Trainer(
         model=model,
@@ -116,7 +145,7 @@ def train():
         data_collator=data_collator,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
-        callbacks=[GenerationCallback(tokenizer)],
+        callbacks=[GenerationCallback(tokenizer), PerplexityCallback()],
     )
 
     # 8. Train
