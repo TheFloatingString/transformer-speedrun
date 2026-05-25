@@ -119,7 +119,7 @@ def train(model_type: str = "gpt2"):
     # 6. Training arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=2,
+        num_train_epochs=10,
         per_device_train_batch_size=8,
         gradient_accumulation_steps=4, # 16 * 4 = 64 effective batch size
         gradient_checkpointing=True,   # Huge memory saver
@@ -184,10 +184,15 @@ def train(model_type: str = "gpt2"):
             if logs is not None:
                 try:
                     if "loss" in logs:
-                        perplexity = math.exp(logs["loss"])
+                        # HF Trainer multiplies loss by gradient_accumulation_steps in
+                        # training_step but does not divide it back before logging, so
+                        # we correct for that here.
+                        true_loss = logs["loss"] / args.gradient_accumulation_steps
+                        logs["loss"] = true_loss
+                        perplexity = math.exp(true_loss)
                         logs["train_perplexity"] = perplexity
                         if wandb.run is not None:
-                            wandb.log({"train_perplexity": perplexity}, step=state.global_step)
+                            wandb.log({"loss": true_loss, "train_perplexity": perplexity}, step=state.global_step)
                     if "eval_loss" in logs:
                         eval_perplexity = math.exp(logs["eval_loss"])
                         logs["eval_perplexity"] = eval_perplexity
