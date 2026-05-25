@@ -121,6 +121,10 @@ class GPT2Config(PretrainedConfig):
         self.n_head = n_head
         self.n_embd = n_embd
         self.model_params = model_params
+        # Standard HF names for compatibility with generate()
+        self.num_hidden_layers = n_layer
+        self.hidden_size = n_embd
+        self.num_attention_heads = n_head
         super().__init__(**kwargs)
 
 from transformers import GenerationMixin, GenerationConfig
