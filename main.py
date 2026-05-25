@@ -155,7 +155,7 @@ def train(model_type: str = "gpt2", force_tokenize: bool = False, muon: bool = T
     # 6. Training arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=1,            # 1 epoch of 100M tokens is ~200k steps at batch 512, but we'll limit by max_steps if needed
+        num_train_epochs=5,            # 1 epoch of 100M tokens is ~200k steps at batch 512, but we'll limit by max_steps if needed
         per_device_train_batch_size=8, # Increased for A100-80GB
         gradient_accumulation_steps=8,  # 64 * 8 = 512 effective batch size
         gradient_checkpointing=True,   # Huge memory saver
