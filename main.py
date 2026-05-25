@@ -1,12 +1,31 @@
 import modal
 
 app = modal.App("transformer-speedrun")
-image = modal.Image.debian_slim().uv_pip_install("transformers[torch]").uv_pip_install("datasets").uv_pip_install("wandb")
+image = (
+    modal.Image.debian_slim()
+    .uv_pip_install("transformers[torch]")
+    .uv_pip_install("datasets")
+    .uv_pip_install("wandb")
+)
 
-@app.function(gpu="a10", image=image, timeout=3600, secrets=[modal.Secret.from_name("wandb-api-key")])
+
+@app.function(
+    gpu="a10",
+    image=image,
+    timeout=3600,
+    secrets=[modal.Secret.from_name("wandb-api-key")],
+)
 def train():
     from datasets import load_dataset
-    from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel, DataCollatorForLanguageModeling, Trainer, TrainingArguments, TrainerCallback
+    from transformers import (
+        AutoTokenizer,
+        GPT2Config,
+        GPT2LMHeadModel,
+        DataCollatorForLanguageModeling,
+        Trainer,
+        TrainingArguments,
+        TrainerCallback,
+    )
     import os
     import wandb
     import torch
@@ -16,7 +35,7 @@ def train():
     print("Loading wikitext-103 dataset...")
     ds = load_dataset("Salesforce/wikitext", "wikitext-103-v1")
 
-    # Only run on 100% of the dataset 
+    # Only run on 100% of the dataset
     print("Subsetting to 100% of dataset...")
     ds["train"] = ds["train"].select(range(int(len(ds["train"]) * 1.0)))
     ds["validation"] = ds["validation"].select(range(int(len(ds["validation"]) * 1.0)))
@@ -33,10 +52,7 @@ def train():
 
     print("Tokenizing dataset...")
     tokenized_datasets = ds.map(
-        tokenize_function,
-        batched=True,
-        num_proc=4,
-        remove_columns=["text"]
+        tokenize_function, batched=True, num_proc=4, remove_columns=["text"]
     )
 
     # Filter out empty examples
@@ -58,9 +74,7 @@ def train():
     model.config.model_params = model_size
 
     # 5. Data collator
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer, mlm=False
-    )
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # 6. Training arguments
     training_args = TrainingArguments(
@@ -72,7 +86,7 @@ def train():
         logging_steps=25,
         learning_rate=5e-4,
         weight_decay=0.01,
-        fp16=True, # Use mixed precision
+        fp16=True,  # Use mixed precision
         lr_scheduler_type="cosine",
         warmup_steps=1000,
         report_to="wandb",
@@ -91,16 +105,18 @@ def train():
                 print(f"\n--- Step {state.global_step} ---")
                 print("Generating sample sentences...")
                 model = kwargs["model"]
-                
+
                 model.eval()
                 prompts = [
                     "The quick brown fox",
                     "Artificial intelligence is",
                     "The history of the world",
                 ]
-                
+
                 for prompt in prompts:
-                    inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+                    inputs = self.tokenizer(prompt, return_tensors="pt").to(
+                        model.device
+                    )
                     with torch.no_grad():
                         outputs = model.generate(
                             **inputs,
@@ -112,10 +128,12 @@ def train():
                             top_p=0.95,
                             temperature=0.7,
                         )
-                    generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    generated_text = self.tokenizer.decode(
+                        outputs[0], skip_special_tokens=True
+                    )
                     print(f"\nPrompt: {prompt}")
                     print(f"Generated: {generated_text}")
-                model.train() # Switch back to training mode
+                model.train()  # Switch back to training mode
                 print("-" * 30)
 
     class PerplexityCallback(TrainerCallback):
@@ -131,11 +149,11 @@ def train():
                         eval_perp = math.exp(logs["eval_loss"])
                         logs["eval_perplexity"] = eval_perp
                         perp_logs["eval_perplexity"] = eval_perp
-                    
+
                     # Directly log to wandb if available to ensure it's recorded
                     if wandb.run is not None and perp_logs:
                         wandb.log(perp_logs, step=state.global_step)
-                        
+
                 except (OverflowError, math.OverflowError):
                     pass
 
@@ -155,8 +173,3 @@ def train():
     # 9. Save the model
     trainer.save_model("./final_model")
     print("Training complete! Model saved to ./final_model")
-
-
-
-
-
