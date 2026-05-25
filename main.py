@@ -22,7 +22,7 @@ image = (
     volumes={"/data": volume},
     secrets=[modal.Secret.from_name("wandb-api-key"), modal.Secret.from_name("huggingface")],
 )
-def train(model_type: str = "gpt2"):
+def train(model_type: str = "gpt2", force_tokenize: bool = False, muon: bool = True):
     from datasets import load_dataset, load_from_disk
     from transformers import (
         AutoTokenizer,
@@ -52,17 +52,19 @@ def train(model_type: str = "gpt2"):
     # 2. Load or tokenize the dataset
     cache_path = "/data/tokenized_fineweb_1b"
     
-    if os.path.exists(cache_path):
+    if os.path.exists(cache_path) and not force_tokenize:
         print(f"Loading tokenized dataset from volume: {cache_path}")
         tokenized_datasets = load_from_disk(cache_path)
     else:
+        if force_tokenize:
+            print("Force tokenize flag set. Re-tokenizing dataset...")
         print("Loading FineWeb (sample-10BT) dataset...")
         # Load 10% of the 10BT sample to get ~1B tokens
         dataset = load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split="train")
         
-        print("Subsetting to 10% of sample-10BT (~1B tokens)...")
-        # Using 10% to approximate 1B tokens (10% of 10B)
-        dataset = dataset.select(range(int(len(dataset) * 0.001)))
+        print("Subsetting to 5% of sample-10BT (~500M tokens)...")
+        # Using 5% to approximate 500M tokens (5% of 10B)
+        dataset = dataset.select(range(int(len(dataset) * 0.05)))
         
         # FineWeb only has a 'train' split, so we create our own validation set
         print("Creating validation split...")
@@ -101,6 +103,7 @@ def train(model_type: str = "gpt2"):
 
     # Check for YAML config in cfg directory
     config_from_yaml = False
+    run_name = f"transformer-speedrun-{model_type}"
     # Check if model_type is a path to a yaml file or a key in cfg
     potential_yaml_paths = [
         os.path.join("/root/cfg", f"{model_type}.yaml"),
@@ -111,8 +114,12 @@ def train(model_type: str = "gpt2"):
     for yaml_path in potential_yaml_paths:
         if yaml_path and os.path.exists(yaml_path):
             print(f"Loading model configuration from {yaml_path}...")
+            # Use the filename as the run name if we load from YAML
+            run_name = os.path.basename(yaml_path).replace(".yaml", "")
             with open(yaml_path, "r") as f:
                 yaml_config = yaml.safe_load(f)
+                if "name" in yaml_config:
+                    run_name = yaml_config["name"]
                 if "hyperparams" in yaml_config:
                     config_params.update(yaml_config["hyperparams"])
                 else:
@@ -148,26 +155,57 @@ def train(model_type: str = "gpt2"):
     # 6. Training arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=10,
-        per_device_train_batch_size=8,
-        gradient_accumulation_steps=4, # 16 * 4 = 64 effective batch size
+        num_train_epochs=1,            # 1 epoch of 100M tokens is ~200k steps at batch 512, but we'll limit by max_steps if needed
+        per_device_train_batch_size=8, # Increased for A100-80GB
+        gradient_accumulation_steps=8,  # 64 * 8 = 512 effective batch size
         gradient_checkpointing=True,   # Huge memory saver
         save_steps=500,
         save_total_limit=2,
         logging_steps=1,
-        learning_rate=5e-4,
+        learning_rate=5e-4,            # This will be overridden by custom optimizer if we pass it
         weight_decay=0.01,
         bf16=True,
         dataloader_num_workers=4,
         lr_scheduler_type="cosine",
-        warmup_steps=1000,
+        warmup_steps=1000,              # Reduced warmup for shorter run
         report_to="wandb",
-        run_name="transformer-speedrun-pretrain-24L-16H-1GPU-Optimized",
+        run_name=run_name,
         eval_strategy="steps",
         eval_steps=100,
+        max_steps=2000,                # Limit steps for the speedrun
     )
 
-    # 7. Initialize Trainer
+    # 7. Custom Optimizer Setup (Muon + AdamW)
+    from src.optimizer import Muon, CombinedOptimizer
+    
+    def get_optimizers(model, learning_rate, weight_decay, use_muon=True):
+        if not use_muon:
+            print("Muon disabled. Using AdamW for all parameters.")
+            return torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        # Filter parameters for Muon (only 2D parameters in transformer layers)
+        muon_params = []
+        adamw_params = []
+        
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            
+            # Muon handles 2D parameters (weights of Linear layers)
+            # but we usually exclude embeddings and the head
+            if "transformer.h" in name and len(p.shape) == 2 and "ln" not in name:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+        
+        optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
+        optimizer_adamw = torch.optim.AdamW(adamw_params, lr=learning_rate, weight_decay=weight_decay)
+        
+        return CombinedOptimizer([optimizer_muon, optimizer_adamw])
+
+    optimizer = get_optimizers(model, training_args.learning_rate, training_args.weight_decay, use_muon=muon)
+
+    # 8. Initialize Trainer
     class GenerationCallback(TrainerCallback):
         def __init__(self, tokenizer):
             self.tokenizer = tokenizer
@@ -231,6 +269,7 @@ def train(model_type: str = "gpt2"):
         data_collator=data_collator,
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
+        optimizers=(optimizer, None), # Trainer accepts (optimizer, scheduler)
         callbacks=[GenerationCallback(tokenizer)],
     )
     # Insert before WandbCallback so logs["loss"] is corrected before wandb reads it
@@ -247,5 +286,5 @@ def train(model_type: str = "gpt2"):
 
 
 @app.local_entrypoint()
-def main(model: str = "gpt2"):
-    train.remote(model_type=model)
+def main(model: str = "gpt2", force_tokenize: bool = False, muon: bool = True):
+    train.remote(model_type=model, force_tokenize=force_tokenize, muon=muon)

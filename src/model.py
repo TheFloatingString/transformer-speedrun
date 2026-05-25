@@ -6,14 +6,17 @@ import math
 from dataclasses import dataclass
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
-class LayerNorm(nn.Module):
-    def __init__(self, n_embd):
+class RMSNorm(nn.Module):
+    def __init__(self, dims, eps=1e-5):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(n_embd))
-        self.bias = nn.Parameter(torch.zeros(n_embd))
+        self.weight = nn.Parameter(torch.ones(dims))
+        self.eps = eps
 
     def forward(self, x):
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+        # x: (B, T, C)
+        norm_x = torch.mean(x * x, dim=-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + self.eps)
+        return self.weight * x_normed
 
 class Attention(nn.Module):
     def __init__(self, n_embd, n_head):
@@ -21,8 +24,8 @@ class Attention(nn.Module):
         self.n_embd = n_embd
         self.n_head = n_head
         self.head_dim = n_embd // n_head
-        self.qkv = nn.Linear(n_embd, 3 * n_embd)
-        self.proj = nn.Linear(n_embd, n_embd)
+        self.qkv = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.proj = nn.Linear(n_embd, n_embd, bias=False)
         # Flag for special GPT-2 residual scaling
         self.proj.RESIDUAL_SCALE_FLAG = True
 
@@ -77,23 +80,27 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd)
-        self.c_proj = nn.Linear(4 * n_embd, n_embd)
+        # SwiGLU: GLU variant using Swish (SiLU)
+        # Increases parameter count by 50% for same hidden dim, 
+        # but here we'll keep the 4*n_embd expansion for the gated part
+        self.c_fc = nn.Linear(n_embd, 2 * 4 * n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
         # Flag for special GPT-2 residual scaling
         self.c_proj.RESIDUAL_SCALE_FLAG = True
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.gelu(x)
+        x, gate = x.chunk(2, dim=-1)
+        x = x * F.silu(gate)
         x = self.c_proj(x)
         return x
 
 class TransformerBlock(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
-        self.ln_1 = LayerNorm(n_embd)
+        self.ln_1 = RMSNorm(n_embd)
         self.attn = Attention(n_embd, n_head)
-        self.ln_2 = LayerNorm(n_embd)
+        self.ln_2 = RMSNorm(n_embd)
         self.mlp = MLP(n_embd)
 
     def forward(self, x):
@@ -140,7 +147,7 @@ class GPT2Modded(nn.Module, GenerationMixin):
                     for _ in range(config.n_layer)
                 ]
             ),
-            "ln_f": LayerNorm(config.n_embd),
+            "ln_f": RMSNorm(config.n_embd),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.config = config
